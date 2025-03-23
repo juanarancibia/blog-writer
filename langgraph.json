@@ -1,0 +1,9 @@
+{
+    "dependencies": [
+        "."
+    ],
+    "graphs": {
+        "research-assistant": "./src/workflows/research-assistant/graph.py"
+    },
+    "env": ".env"
+}

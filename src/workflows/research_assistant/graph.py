@@ -3,7 +3,9 @@ from langgraph.graph import END, START, StateGraph
 from tavily import TavilyClient
 from typing_extensions import Literal
 
-from src.utils import extract_result_from_tags, get_llm_reasoner_model
+from lib.utils import get_structured_output_with_retry
+from workflows.research_assistant.models import FirstQueryResponse, ReflectionResponse, SummarizerResponse
+from workflows.research_assistant.prompt import GENERATE_FIRST_QUERY_PROMPT, REFLECT_ON_SUMMARY_PROMPT, get_summary_prompt
 from workflows.research_assistant.state import (InputState, OutputState,
                                                 OverallState)
 
@@ -45,17 +47,9 @@ def generate_first_query(state: InputState):
     Generate a search query based on the topic provided in the state.
     """
 
-    prompt = (
-        f"Your goal is to generate a targeted web search query."
-        "The query will gather information related to a specific topic."
-        "Do not give me extra information, all I need is a search query"
-        f"The topic is: {state['topic']}"
-        "Please return the query wrapped in <query> tags. For example: <query>Suggested query</query>"
-    )
+    prompt = GENERATE_FIRST_QUERY_PROMPT.format(topic=state.get("topic", ""))
 
-    reasoner_llm = get_llm_reasoner_model()
-    response = reasoner_llm(prompt)
-    query = extract_result_from_tags("query", response.content)
+    query = get_structured_output_with_retry(FirstQueryResponse, prompt).query
 
     return {"search_query": query}
 
@@ -83,31 +77,11 @@ def summarize_sources(state: OverallState):
 
     last_web_search = state["web_search_results"][-1]
 
-    prompt = (
-        "Generate a high-quality summary of the web search results and keep it related to the topic."
-        "Highlight the most relevant information related to the topic from the search results"
-        "The topic is: {state['topic']}"
+    prompt = get_summary_prompt(
+        state["topic"], get_response_str(last_web_search), existing_summary
     )
 
-    if existing_summary != "":
-        prompt += (
-            "Compare the new information with the existing summary. "
-            "For each piece of new information:"
-            "If it's related to existing points, integrate it into the relevant paragraph."
-            "If it's entirely new but relevant, add a new paragraph with a smooth transition."
-            "If it's not relevant to the user topic, skip it."
-            f"\nPlease extend the existing summary with the new information from the latest search results."
-            f"\nExisting summary: {existing_summary}"
-            f"\nNew search results: {last_web_search}"
-        )
-    else:
-        prompt += f"\nSearch results: {last_web_search}"
-
-    prompt += "Please return the summary wrapped in <summary> tags. For example: <summary>Suggested summary</summary>"
-
-    reasoner_llm = get_llm_reasoner_model()
-    response = reasoner_llm(prompt)
-    summary = extract_result_from_tags("summary", response.content)
+    summary = get_structured_output_with_retry(SummarizerResponse, prompt).summary
 
     return {"summary": summary}
 
@@ -117,23 +91,14 @@ def reflect_on_suumary(state: OverallState):
     Refelect on summary and generate a follow up query.
     """
 
-    prompt = (
-        "Identify knowledge gaps or areas that need deeper exploration"
-        "Reflect on the summary and generate a follow-up question to deepen your understanding."
-        "Focus on technical details, implementation specifics, or emerging trends that weren't fully covered"
-        "The follow-up question should be concise enough to be a web search query"
-        "The query should be at max 15 words"
-        f"The topic is: {state['topic']}"
-        f"The summary is: {state['summary']}"
-        "Please return the query wrapped in <query> tags. For example: <query>Suggested query</query>"
+    prompt = REFLECT_ON_SUMMARY_PROMPT.format(
+        topic=state["topic"], summary=state["summary"]
     )
-
-    reasoner_llm = get_llm_reasoner_model()
-    response = reasoner_llm(prompt)
-    query = extract_result_from_tags("query", response.content)
+    query = get_structured_output_with_retry(ReflectionResponse, prompt).query
 
     query = query if len(
         query) <= 140 else f"Tell me more about {state['research_topic']}"
+    
     return {"search_query": query}
 
 
@@ -179,3 +144,13 @@ def get_workflow():
     builder.add_edge("finalize_summary", END)
 
     return builder.compile()
+
+def invoke_graph(topic, callables):
+    runnable = get_workflow()
+
+    # Ensure the callables parameter is a list as you can have multiple callbacks
+    if not isinstance(callables, list):
+        raise TypeError("callables must be a list")
+
+    # Invoke the graph with the current messages and callback configuration
+    return runnable.invoke({"topic": topic, "max_web_searchs": 3}, config={"callbacks": callables})
